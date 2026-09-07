@@ -1296,7 +1296,7 @@ class SurbhiCollectionApp:
         lines.append(SEP_MARKER)
         
         lines.append("No Guarantee / No Return".center(W))
-        lines.append("Thank You for Shopping! Visit Again")
+        lines.append("Thank You for Shopping! Visit Again".centre(W))
         
         side_pad = "  "
         full_width = W + (len(side_pad) * 2)
