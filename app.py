@@ -324,6 +324,7 @@ class SurbhiCollectionApp:
         self.global_discount_entry.bind("<KeyRelease>", lambda e: self.calculate_bill_totals())
         
         tk.Button(bottom_row, text="PRINT & SAVE INVOICE", font=("Segoe UI", 11, "bold"), bg="#2e7d32", fg="white", activebackground="#1b5e20", relief="flat", padx=20, pady=8, command=self.commit_and_print_invoice).pack(side="right", padx=10, pady=5)
+        tk.Button(bottom_row, text="Just Save", font=("Segoe UI", 10, "bold"), bg="#d35400", fg="white", activebackground="#e67e22", relief="flat", padx=10, pady=8, command=self.just_save_invoice).pack(side="right", padx=5, pady=5)
         tk.Button(bottom_row, text="Reset Slot", font=("Segoe UI", 10), bg="#7f8c8d", fg="white", activebackground="#616161", relief="flat", padx=5, pady=8, command=self.clear_complete_billing_grid).pack(side="right", padx=5, pady=5)
 
         hist_bar = tk.Frame(self.billing_tab, bg="#e2e8f0")
@@ -783,6 +784,80 @@ class SurbhiCollectionApp:
                 
             self.cust_name_entry.focus()
 
+    def just_save_invoice(self):
+        if not self.cart_items: return
+        
+        committed_bill_no = self.current_bill_no
+        c_phone = self.cust_phone_entry.get().strip()
+        c_name = " ".join(self.cust_name_entry.get().split())
+        
+        if not c_name: c_name = "Guest Customer"
+        if not c_phone: c_phone = "-"
+        
+        now_dt = datetime.now()
+        date_str = now_dt.strftime("%Y-%m-%d")
+        year_val = now_dt.year
+        
+        try:
+            disc_pct = float(self.global_discount_entry.get() if self.global_discount_entry.get() else 0)
+        except ValueError: 
+            disc_pct = 0.0
+            
+        gross_total = sum((float(i["price"]) * float(i["qty"])) for i in self.cart_items)
+        saved = gross_total * (disc_pct / 100.0)
+        original_grand_total = round(gross_total - saved)
+        
+        conn = self.get_db_connection(); cursor = conn.cursor()
+        for item in self.cart_items:
+            raw_total = item["price"] * item["qty"]
+            allocated_item_disc = raw_total * (disc_pct / 100.0)
+            final_item_price = raw_total - allocated_item_disc
+            calculated_item_comm = final_item_price * (item["comm_pct"] / 100.0)
+            
+            cursor.execute('''
+                INSERT INTO sales_ledger (
+                    bill_no, sale_date, sale_year, item_no, qty, unit_price, raw_total, 
+                    allocated_discount, final_item_price, calculated_commission, salesman_no, payment_mode, customer_phone, customer_name
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                committed_bill_no, date_str, year_val, item["item_no"], item["qty"], item["price"], raw_total,
+                allocated_item_disc, final_item_price, calculated_item_comm, item["salesman_no"], "N/A", c_phone, c_name
+            ))
+        conn.commit(); conn.close()
+        
+        monthly_bills_dir, sales_analysis_path, salesman_data_path, customer_ledger_path = self.get_archive_paths()
+        
+        receipt_text = self.build_receipt_string(c_name, c_phone, disc_pct, bill_no=committed_bill_no)
+        invoice_path = os.path.join(monthly_bills_dir, f"Bill_{committed_bill_no}.txt")
+        with open(invoice_path, "w", encoding="utf-8") as f: f.write(receipt_text)
+            
+        self.generate_excel_reports(sales_analysis_path, salesman_data_path)
+        self.update_customer_ledger_excel(customer_ledger_path)
+
+        # Reset return mode state back to False after saving the bill
+        self.is_return_mode.set(False)
+            
+        if len(self.draft_slots) > 1:
+            del self.draft_slots[self.active_slot_id]
+            next_slot_id = list(self.draft_slots.keys())[0]
+            self.switch_to_slot(next_slot_id)
+        else:
+            is_ret = False
+            self.draft_slots[self.active_slot_id] = {
+                "cart_items": [],
+                "cust_name": "",
+                "cust_phone": "",
+                "disc_pct": "10",
+                "bill_no": self.get_next_bill_number(is_return=is_ret),
+                "is_return": is_ret
+            }
+            self.switch_to_slot(self.active_slot_id)
+            
+        self.clear_item_input_fields(keep_customer_and_salesman=False)
+        self.refresh_admin_views()
+        
+        self.prompt_post_print_settlement(committed_bill_no, original_grand_total, sales_analysis_path, salesman_data_path)
+
     def commit_and_print_invoice(self):
         if not self.cart_items: return
         
@@ -948,10 +1023,19 @@ class SurbhiCollectionApp:
     def open_recent_bills_lookup(self):
         lookup_win = tk.Toplevel(self.root)
         lookup_win.title("Recent Bills Registry & Adjustments")
-        lookup_win.geometry("800x480")
+        lookup_win.geometry("800x520")
         lookup_win.configure(bg="#f8f9fa")
         
-        tk.Label(lookup_win, text="Select Recent Bill to Modify, Cancel or Remove Items", font=("Segoe UI", 11, "bold"), fg="#2c3e50", bg="#f8f9fa").pack(pady=10)
+        tk.Label(lookup_win, text="Select Recent Bill to Modify, Cancel or Remove Items", font=("Segoe UI", 11, "bold"), fg="#2c3e50", bg="#f8f9fa").pack(pady=(10, 5))
+        
+        # --- Live Search Filter Bar ---
+        search_frame = tk.Frame(lookup_win, bg="#f8f9fa")
+        search_frame.pack(fill="x", padx=15, pady=5)
+        
+        tk.Label(search_frame, text="🔍 Search Bill No / Customer / Phone:", font=("Segoe UI", 9, "bold"), bg="#f8f9fa", fg="#2c3e50").pack(side="left", padx=(0, 5))
+        
+        search_ent = tk.Entry(search_frame, font=("Segoe UI", 10), bd=1, relief="solid")
+        search_ent.pack(side="left", fill="x", expand=True, padx=5, ipady=3)
         
         tree_frame = tk.Frame(lookup_win, bg="#ffffff")
         tree_frame.pack(fill="both", expand=True, padx=15, pady=5)
@@ -971,20 +1055,35 @@ class SurbhiCollectionApp:
         b_tree.column("total", width=120, anchor="center")
         b_tree.pack(fill="both", expand=True)
         
-        def reload_recent_bills():
+        def reload_recent_bills(search_query=""):
             for row in b_tree.get_children():
                 b_tree.delete(row)
-            conn = self.get_db_connection(); cursor = conn.cursor()
-            cursor.execute("""
-                SELECT bill_no, sale_date, customer_name, customer_phone, SUM(final_item_price) 
-                FROM sales_ledger 
-                GROUP BY bill_no 
-                ORDER BY id DESC LIMIT 25
-            """)
+            
+            conn = self.get_db_connection()
+            cursor = conn.cursor()
+            
+            clean_q = search_query.strip()
+            if clean_q:
+                cursor.execute("""
+                    SELECT bill_no, sale_date, customer_name, customer_phone, SUM(final_item_price) 
+                    FROM sales_ledger 
+                    WHERE bill_no LIKE ? OR customer_name LIKE ? OR customer_phone LIKE ?
+                    GROUP BY bill_no 
+                    ORDER BY id DESC LIMIT 50
+                """, (f"%{clean_q}%", f"%{clean_q}%", f"%{clean_q}%"))
+            else:
+                cursor.execute("""
+                    SELECT bill_no, sale_date, customer_name, customer_phone, SUM(final_item_price) 
+                    FROM sales_ledger 
+                    GROUP BY bill_no 
+                    ORDER BY id DESC LIMIT 25
+                """)
+                
             for row in cursor.fetchall():
                 b_tree.insert("", "end", values=(row[0], row[1], row[2], row[3], f"{row[4]:.2f}"))
             conn.close()
 
+        search_ent.bind("<KeyRelease>", lambda e: reload_recent_bills(search_ent.get()))
         reload_recent_bills()
         
         act_frame = tk.Frame(lookup_win, bg="#f8f9fa")
@@ -1001,7 +1100,7 @@ class SurbhiCollectionApp:
             if new_val is not None:
                 _, sales_analysis_path, salesman_data_path, _ = self.get_archive_paths()
                 self.apply_bill_adjustment(b_no, curr_amt, new_val, sales_analysis_path, salesman_data_path)
-                reload_recent_bills()
+                reload_recent_bills(search_ent.get())
 
         def cancel_selected_bill():
             sel = b_tree.selection()
@@ -1011,13 +1110,13 @@ class SurbhiCollectionApp:
             if messagebox.askyesno("Cross Out / Void Bill", f"Are you sure you want to cancel Bill #{b_no}? This will clear amounts in ledger.", parent=lookup_win):
                 _, sales_analysis_path, salesman_data_path, _ = self.get_archive_paths()
                 self.apply_bill_adjustment(b_no, float(val[4]), 0.0, sales_analysis_path, salesman_data_path)
-                reload_recent_bills()
+                reload_recent_bills(search_ent.get())
 
         def manage_items_in_bill():
             sel = b_tree.selection()
             if not sel: return
             b_no = b_tree.item(sel[0], "values")[0]
-            self.open_bill_item_return_window(b_no, reload_recent_bills)
+            self.open_bill_item_return_window(b_no, lambda: reload_recent_bills(search_ent.get()))
 
         tk.Button(act_frame, text="📦 Cancel Specific Item", font=("Segoe UI", 9, "bold"), bg="#e67e22", fg="white", relief="flat", padx=12, pady=5, command=manage_items_in_bill).pack(side="left", padx=5)
         tk.Button(act_frame, text="✏️ Adjust Received Amount", font=("Segoe UI", 9, "bold"), bg="#2980b9", fg="white", relief="flat", padx=12, pady=5, command=edit_selected_bill).pack(side="left", padx=5)
@@ -1296,7 +1395,7 @@ class SurbhiCollectionApp:
         lines.append(SEP_MARKER)
         
         lines.append("No Guarantee / No Return".center(W))
-        lines.append("Thank You for Shopping! Visit Again".centre(W))
+        lines.append("Thank You for Shopping! Visit Again".center(W))
         
         side_pad = "  "
         full_width = W + (len(side_pad) * 2)
